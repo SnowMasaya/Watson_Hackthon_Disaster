@@ -16,7 +16,7 @@ object SparkLogic {
   /**
    * 解析に使う analyzeRanking, analyzeRankingWithStream のいずれかのメソッド名を指定してください
    */
-  val analyzeLogic: analyzeLogicType = analyzeRanking
+  val analyzeLogic: analyzeLogicType = analyzeRankingWithStream
 
   /**
    * クラスパス上にある tweets.txt のパス
@@ -75,20 +75,48 @@ object SparkLogic {
         status.getText
       }
 
+    // 1.日本語のツイートを抽出
+    val japaneseTweetStream: DStream[String] =
+      tweetStream.filter(containsJapaneseChar)
+
+    // 2.ハッシュタグを抽出
+    val hashTagTweetPairStream: DStream[(String, String)] =
+      for{
+        tweet   <- japaneseTweetStream
+        hashTag <- pickHashTags(tweet)
+      } yield (hashTag, tweet)
+
+    // 3.ハッシュタグでグループ分け
+    // 過去1分間のツイートを1秒ごとに集計 ⇒ window: 1分 と slide: 1秒 を指定
+    val hashTagGroupsStream: DStream[(String, Iterable[String])] =
+      hashTagTweetPairStream.groupByKeyAndWindow(Minutes(1), Seconds(1))
+
     // ストリームの塊を処理する
-    tweetStream.foreachRDD { rdd: RDD[String] =>
+    hashTagGroupsStream.foreachRDD { rdd: RDD[(String, Iterable[String])] =>
 
-        // Ranking に変換する RDD
-        val rankingsRDD = rdd map { tweet: String =>
-            // String を Ranking ケースクラスに変換
-            Ranking("#hashTag", rank = 1, Array(tweet), sampleCount = 1)
-        }
+      // 4.ツイートの多い順にソート
+      val sortedHashTagGroupsRDD: RDD[(String, Iterable[String])] =
+        rdd.sortBy({ case (_, tweets) =>
+          tweets.size
+        }, ascending = false)
 
-        // collect() を呼び出すことによって実際の RDD の処理が始まる
-        val rankings = rankingsRDD.collect()
+      // 5.ランクを設定
+      val rankedHashTagGroupsRDD: RDD[((String, Iterable[String]), Long)] =
+        sortedHashTagGroupsRDD.zipWithIndex()
 
-        receiver ! rankings
+      // Ranking に変換する RDD
+      val rankingsRDD = rankedHashTagGroupsRDD map {
+        case ((hashTag, tweets), index) =>
+          // String を Ranking ケースクラスに変換
+          // index は 0 開始 なので + 1 しておく
+          Ranking(hashTag, rank = index + 1, tweets.toArray, sampleCount = tweets.size)
       }
+
+      // collect() を呼び出すことによって実際の RDD の処理が始まる
+      val rankings = rankingsRDD.collect()
+
+      receiver ! rankings
+    }
 
     // start() を呼び出すことによって上記で定義した Stream の処理が始まる
     ssc.start()
